@@ -1,9 +1,8 @@
 const net = require('net');
 const crypto = require('crypto');
-const readline = require('readline');
 const {
   parseMessages,
-  verifyCertificate,
+  verifyCertificateWithCA,
   generateSessionKey,
   encryptMessage,
   decryptMessage,
@@ -19,11 +18,13 @@ class DistributedNode {
     this.caPort = caPort;
     this.server = null;
     this.peers = new Map();
-    this.routingTable = new Map();
-    this.topology = new Map();
+    this.routingTable = new Map(); // destination -> nextHop
+    this.topology = new Map(); // nodeId -> [connected nodeIds]
 
+    // Максимальний розмір пакета в байтах
     this.MAX_PACKET_SIZE = 128;
 
+    // Генерація пари ключів для вузла
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
       modulusLength: 2048,
       publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -35,6 +36,7 @@ class DistributedNode {
     this.certificate = null;
     this.caPublicKey = null;
 
+    // Буфер для фрагментованих повідомлень
     this.fragmentBuffer = new Map();
 
     console.log(
@@ -47,6 +49,7 @@ class DistributedNode {
     this.startServer();
   }
 
+  // Отримання сертифіката від CA
   obtainCertificate() {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
@@ -96,7 +99,7 @@ class DistributedNode {
       console.log(`[${this.nodeId}] Сервер запущено на порту ${this.port}`);
     });
   }
-
+  // Обробка вхідних з'єднань від інших нод
   handleIncomingConnection(socket) {
     let peerNodeId = null;
     let sessionKey = null;
@@ -109,31 +112,26 @@ class DistributedNode {
 
         messages.forEach((message) => {
           switch (message.type) {
+            // Початок TLS Handshake
             case 'NODE_HELLO':
               peerNodeId = message.nodeId;
               clientRandom = message.clientRandom;
+              serverRandom = crypto.randomBytes(32).toString('hex');
 
-              if (verifyCertificate(message.certificate, this.caPublicKey)) {
-                serverRandom = crypto.randomBytes(32).toString('hex');
+              socket.write(
+                JSON.stringify({
+                  type: 'NODE_SERVER_HELLO',
+                  nodeId: this.nodeId,
+                  serverRandom: serverRandom,
+                  certificate: this.certificate,
+                  publicKey: this.publicKey,
+                  topology: getFullTopology(this.topology),
+                }) + '\n'
+              );
 
-                socket.write(
-                  JSON.stringify({
-                    type: 'NODE_SERVER_HELLO',
-                    nodeId: this.nodeId,
-                    serverRandom: serverRandom,
-                    certificate: this.certificate,
-                    publicKey: this.publicKey,
-                    topology: getFullTopology(this.topology),
-                  }) + '\n'
-                );
-              } else {
-                console.log(
-                  `[${this.nodeId}] УВАГА: Невалідний сертифікат ${peerNodeId}`
-                );
-                socket.end();
-              }
               break;
 
+            // Завершення TLS Handshake
             case 'NODE_KEY_EXCHANGE':
               const encryptedPremaster = Buffer.from(
                 message.encryptedPremaster,
@@ -186,12 +184,14 @@ class DistributedNode {
               this.broadcastTopologyUpdate();
               break;
 
+            // Обробка зашифрованих даних
             case 'ENCRYPTED_DATA':
               const decryptedData = decryptMessage(message.data, sessionKey);
               const payload = JSON.parse(decryptedData);
               this.handleEncryptedMessage(payload, peerNodeId, sessionKey);
               break;
 
+            // Обробка фрагментів повідомлень
             case 'FRAGMENT':
               this.handleFragment(message, peerNodeId);
               break;
@@ -214,7 +214,8 @@ class DistributedNode {
     });
   }
 
-  connectToPeer(peerNodeId, host, port) {
+  // Встановлення з'єднання з іншим вузлом
+  async connectToPeer(peerNodeId, host, port) {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
       let serverRandom = null;
@@ -238,9 +239,33 @@ class DistributedNode {
         try {
           const messages = parseMessages(data.toString());
 
-          messages.forEach((message) => {
+          messages.forEach(async (message) => {
             switch (message.type) {
+              // Відповідь на NODE_HELLO
               case 'NODE_SERVER_HELLO':
+                // Перевірка сертифіката сервера
+                console.log(
+                  `[${this.nodeId}] 🔐 Перевірка сертифіката ${peerNodeId} через CA...`
+                );
+
+                const isValid = await verifyCertificateWithCA(
+                  message.certificate,
+                  this.caPort
+                );
+
+                if (!isValid) {
+                  console.log(
+                    `[${this.nodeId}] З'єднання відхилено: невалідний сертифікат від ${peerNodeId}`
+                  );
+                  socket.destroy();
+                  reject(new Error(`Invalid certificate from ${peerNodeId}`));
+                  return;
+                }
+
+                console.log(
+                  `[${this.nodeId}] ✓ Сертифікат ${peerNodeId} валідний`
+                );
+
                 serverRandom = message.serverRandom;
                 peerPublicKey = message.publicKey;
 
@@ -265,12 +290,14 @@ class DistributedNode {
                 );
                 break;
 
+              // Відповідь на NODE_KEY_EXCHANGE
               case 'NODE_FINISHED':
                 const sessionKey = generateSessionKey(
                   clientRandom,
                   serverRandom,
                   premasterSecret
                 );
+                const decrypted = decryptMessage(message.encrypted, sessionKey);
                 console.log(
                   `[${this.nodeId}] ✓ Handshake завершено з ${peerNodeId}`
                 );
@@ -296,6 +323,7 @@ class DistributedNode {
                 resolve();
                 break;
 
+              // Обробка зашифрованих даних
               case 'ENCRYPTED_DATA':
                 const peer = this.peers.get(peerNodeId);
                 if (peer) {
@@ -312,6 +340,7 @@ class DistributedNode {
                 }
                 break;
 
+              // Обробка фрагментів повідомлень
               case 'FRAGMENT':
                 const peerData = this.peers.get(peerNodeId);
                 if (peerData) {
@@ -350,6 +379,7 @@ class DistributedNode {
     buffer.fragments[fragmentIndex] = Buffer.from(data, 'base64');
     buffer.received++;
 
+    // Коли всі фрагменти отримано
     if (buffer.received === buffer.totalFragments) {
       const completeMessage = Buffer.concat(buffer.fragments).toString('utf8');
       const message = JSON.parse(completeMessage);
@@ -362,12 +392,14 @@ class DistributedNode {
 
   handleEncryptedMessage(payload, fromNodeId) {
     switch (payload.messageType) {
+      // Чат повідомлення
       case 'CHAT':
         console.log(
           `\n[${this.nodeId}] Повідомлення від ${fromNodeId}: ${payload.content}\n`
         );
         break;
 
+      // Broadcast повідомлення
       case 'BROADCAST':
         console.log(
           `\n[${this.nodeId}] Broadcast від ${payload.sourceNode}: ${payload.content}`
@@ -381,6 +413,7 @@ class DistributedNode {
         this.forwardBroadcast(payload, fromNodeId);
         break;
 
+      // Маршрутизоване повідомлення
       case 'ROUTED':
         if (payload.destination === this.nodeId) {
           console.log(
@@ -394,6 +427,7 @@ class DistributedNode {
         }
         break;
 
+      // Оновлення топології
       case 'TOPOLOGY_UPDATE':
         if (payload.topology) {
           mergeTopology(this.topology, payload.topology, this.nodeId);
@@ -473,6 +507,7 @@ class DistributedNode {
 
     console.log(`\n[${this.nodeId}] Відправка broadcast: ${content}`);
 
+    // Відправка всім сусідам
     this.peers.forEach((peer, nodeId) => {
       console.log(`[${this.nodeId}]    -> до ${nodeId}`);
       this.sendEncryptedMessage(peer.socket, payload, peer.sessionKey);
@@ -522,6 +557,7 @@ class DistributedNode {
     const previous = new Map();
     const unvisited = new Set();
 
+    // Ініціалізація
     this.topology.forEach((_, nodeId) => {
       distances.set(nodeId, Number.POSITIVE_INFINITY);
       previous.set(nodeId, null);
@@ -530,6 +566,7 @@ class DistributedNode {
 
     distances.set(this.nodeId, 0);
 
+    // Алгоритм Дейкстри
     while (unvisited.size > 0) {
       let current = null;
       let minDistance = Number.POSITIVE_INFINITY;
@@ -558,6 +595,7 @@ class DistributedNode {
       });
     }
 
+    // Побудова таблиці маршрутизації
     this.topology.forEach((_, destination) => {
       if (destination !== this.nodeId) {
         let current = destination;

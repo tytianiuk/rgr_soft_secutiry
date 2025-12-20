@@ -13,6 +13,7 @@ class CertificateAuthority {
       fs.mkdirSync(this.certDirectory);
     }
 
+    // Генерація пари ключів RSA для CA
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
       modulusLength: 4096,
       publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -50,6 +51,7 @@ class CertificateAuthority {
         const request = JSON.parse(data.toString());
 
         switch (request.type) {
+          // Запит на підпис сертифіката
           case 'SIGN_CERTIFICATE':
             console.log(`Запит на підпис сертифіката від: ${request.nodeId}`);
             const signedCert = this.signCertificate(
@@ -70,6 +72,7 @@ class CertificateAuthority {
             console.log(`Сертифікат підписано для: ${request.nodeId}\n`);
             break;
 
+          // Запит на перевірку сертифіката
           case 'VERIFY_CERTIFICATE':
             console.log(`Запит на перевірку сертифіката: ${request.nodeId}`);
             const isValid = this.verifyCertificate(request.certificate);
@@ -81,13 +84,9 @@ class CertificateAuthority {
                 nodeId: request.nodeId,
               })
             );
-            console.log(
-              `Результат перевірки для ${request.nodeId}: ${
-                isValid ? 'ВАЛІДНИЙ' : 'НЕВАЛІДНИЙ'
-              }\n`
-            );
             break;
 
+          // Запит на отримання публічного ключа CA
           case 'GET_CA_PUBLIC_KEY':
             socket.write(
               JSON.stringify({
@@ -181,7 +180,6 @@ class CertificateAuthority {
 
       return isValid;
     } catch (error) {
-      console.error('  Помилка при перевірці:', error.message);
       return false;
     }
   }

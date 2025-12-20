@@ -1,43 +1,49 @@
 const crypto = require('crypto');
+const net = require('net');
+
+function verifyCertificateWithCA(certificate, caPort = 9000) {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+
+    socket.connect(caPort, 'localhost', () => {
+      socket.write(
+        JSON.stringify({
+          type: 'VERIFY_CERTIFICATE',
+          nodeId: certificate.nodeId,
+          certificate: certificate,
+        })
+      );
+    });
+
+    socket.on('data', (data) => {
+      try {
+        const response = JSON.parse(data.toString());
+
+        if (response.type === 'VERIFICATION_RESULT') {
+          socket.end();
+          resolve(response.valid);
+        }
+      } catch (error) {
+        socket.end();
+        reject(error);
+      }
+    });
+
+    socket.on('error', (error) => {
+      reject(error);
+    });
+
+    socket.setTimeout(5000);
+    socket.on('timeout', () => {
+      socket.destroy();
+      reject(new Error('CA verification timeout'));
+    });
+  });
+}
 
 function parseMessages(data) {
   const lines = data.trim().split('\n');
   return lines.map((line) => JSON.parse(line));
-}
-
-function verifyCertificate(certificate, caPublicKey) {
-  try {
-    const now = Date.now();
-    const validFrom = new Date(certificate.validFrom).getTime();
-    const validTo = new Date(certificate.validTo).getTime();
-
-    if (now < validFrom || now > validTo) {
-      return false;
-    }
-
-    const certData = JSON.stringify({
-      serialNumber: certificate.serialNumber,
-      nodeId: certificate.nodeId,
-      publicKey: certificate.publicKey,
-      validFrom: certificate.validFrom,
-      validTo: certificate.validTo,
-    });
-
-    const signatureBuffer = Buffer.from(certificate.signature, 'base64');
-    const isValid = crypto.verify(
-      'sha256',
-      Buffer.from(certData),
-      {
-        key: caPublicKey,
-        padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-      },
-      signatureBuffer
-    );
-
-    return isValid;
-  } catch (error) {
-    return false;
-  }
 }
 
 function generateSessionKey(clientRandom, serverRandom, premasterSecret) {
@@ -125,7 +131,7 @@ function mergeTopology(localTopology, receivedTopology) {
 
 module.exports = {
   parseMessages,
-  verifyCertificate,
+  verifyCertificateWithCA,
   generateSessionKey,
   encryptMessage,
   decryptMessage,
