@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const net = require('net');
 
+// Функція для перевірки сертифіката через CA сервер
 function verifyCertificateWithCA(certificate, caPort = 9000) {
   return new Promise((resolve, reject) => {
     const socket = new net.Socket();
@@ -41,16 +42,19 @@ function verifyCertificateWithCA(certificate, caPort = 9000) {
   });
 }
 
+// Функція для розбору вхідних повідомлень
 function parseMessages(data) {
   const lines = data.trim().split('\n');
   return lines.map((line) => JSON.parse(line));
 }
 
+// Функція для генерації сесійного ключа
 function generateSessionKey(clientRandom, serverRandom, premasterSecret) {
   const material = clientRandom + serverRandom + premasterSecret;
   return crypto.createHash('sha256').update(material).digest('hex');
 }
 
+// Функції для шифрування та дешифрування повідомлень
 function encryptMessage(message, sessionKey) {
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv(
@@ -77,6 +81,7 @@ function decryptMessage(encryptedData, sessionKey) {
   return decrypted;
 }
 
+// Функція для фрагментації повідомлень
 function fragmentMessage(message, maxPacketSize) {
   const messageStr = JSON.stringify(message);
   const messageBuffer = Buffer.from(messageStr, 'utf8');
@@ -102,6 +107,7 @@ function fragmentMessage(message, maxPacketSize) {
   return fragments;
 }
 
+// Функція для отримання повної топології мережі
 function getFullTopology(topologyMap) {
   const fullTopology = {};
   topologyMap.forEach((neighbors, nodeId) => {
@@ -110,23 +116,30 @@ function getFullTopology(topologyMap) {
   return fullTopology;
 }
 
+// Функція для злиття отриманої топології з локальною
 function mergeTopology(localTopology, receivedTopology) {
   if (Array.isArray(receivedTopology)) {
-    return;
+    return false;
   }
+
+  let changed = false;
 
   Object.keys(receivedTopology).forEach((node) => {
     if (!localTopology.has(node)) {
       localTopology.set(node, []);
+      changed = true;
     }
 
     const neighbors = receivedTopology[node];
     neighbors.forEach((neighbor) => {
       if (!localTopology.get(node).includes(neighbor)) {
         localTopology.get(node).push(neighbor);
+        changed = true;
       }
     });
   });
+
+  return changed;
 }
 
 module.exports = {

@@ -22,7 +22,7 @@ class DistributedNode {
     this.topology = new Map(); // nodeId -> [connected nodeIds]
 
     // Максимальний розмір пакета в байтах
-    this.MAX_PACKET_SIZE = 128;
+    this.MAX_PACKET_SIZE = 16;
 
     // Генерація пари ключів для вузла
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -117,7 +117,7 @@ class DistributedNode {
               peerNodeId = message.nodeId;
               clientRandom = message.clientRandom;
               serverRandom = crypto.randomBytes(32).toString('hex');
-
+              // Відповідь сервера
               socket.write(
                 JSON.stringify({
                   type: 'NODE_SERVER_HELLO',
@@ -152,15 +152,12 @@ class DistributedNode {
                 serverRandom,
                 premasterSecret
               );
-              const finishedMsg = encryptMessage('NODE_FINISHED', sessionKey);
+              const finishedMsg = encryptMessage('SERVER_FINISHED', sessionKey);
               socket.write(
                 JSON.stringify({
-                  type: 'NODE_FINISHED',
+                  type: 'SERVER_FINISHED',
                   encrypted: finishedMsg,
                 }) + '\n'
-              );
-              console.log(
-                `[${this.nodeId}] ✓ Handshake завершено з ${peerNodeId}`
               );
 
               this.peers.set(peerNodeId, {
@@ -168,7 +165,18 @@ class DistributedNode {
                 sessionKey: sessionKey,
                 nodeId: peerNodeId,
               });
+              break;
 
+            case 'CLIENT_FINISHED':
+              const decrypted = decryptMessage(message.encrypted, sessionKey);
+              // Перевірка повідомлення CLIENT_FINISHED
+              if (decrypted == 'CLIENT_FINISHED') {
+                console.log(
+                  `[${this.nodeId}] ✓ Handshake завершено з ${peerNodeId}`
+                );
+              }
+
+              // Оновлюємо топологію після повного завершення handshake
               if (!this.topology.has(this.nodeId)) {
                 this.topology.set(this.nodeId, []);
               }
@@ -223,6 +231,7 @@ class DistributedNode {
       const premasterSecret = crypto.randomBytes(48).toString('hex');
       let peerPublicKey = null;
 
+      // Початок з'єднання
       socket.connect(port, host, () => {
         socket.write(
           JSON.stringify({
@@ -291,24 +300,38 @@ class DistributedNode {
                 break;
 
               // Відповідь на NODE_KEY_EXCHANGE
-              case 'NODE_FINISHED':
+              case 'SERVER_FINISHED':
                 const sessionKey = generateSessionKey(
                   clientRandom,
                   serverRandom,
                   premasterSecret
                 );
                 const decrypted = decryptMessage(message.encrypted, sessionKey);
-                console.log(
-                  `[${this.nodeId}] ✓ Handshake завершено з ${peerNodeId}`
-                );
+                // Перевірка повідомлення SERVER_FINISHED
+                if (decrypted == 'SERVER_FINISHED') {
+                  const clientFinishedMsg = encryptMessage(
+                    'CLIENT_FINISHED',
+                    sessionKey
+                  );
+                  socket.write(
+                    JSON.stringify({
+                      type: 'CLIENT_FINISHED',
+                      encrypted: clientFinishedMsg,
+                    }) + '\n'
+                  );
 
-                this.peers.set(peerNodeId, {
-                  socket: socket,
-                  sessionKey: sessionKey,
-                  nodeId: peerNodeId,
-                  host: host,
-                  port: port,
-                });
+                  console.log(
+                    `[${this.nodeId}] ✓ Handshake завершено з ${peerNodeId}`
+                  );
+
+                  this.peers.set(peerNodeId, {
+                    socket: socket,
+                    sessionKey: sessionKey,
+                    nodeId: peerNodeId,
+                    host: host,
+                    port: port,
+                  });
+                }
 
                 if (!this.topology.has(this.nodeId)) {
                   this.topology.set(this.nodeId, []);
@@ -430,8 +453,35 @@ class DistributedNode {
       // Оновлення топології
       case 'TOPOLOGY_UPDATE':
         if (payload.topology) {
-          mergeTopology(this.topology, payload.topology, this.nodeId);
-          this.buildRoutingTable();
+          const topologyChanged = mergeTopology(
+            this.topology,
+            payload.topology,
+            this.nodeId
+          );
+
+          if (topologyChanged) {
+            this.buildRoutingTable();
+
+            if (!payload.visited) payload.visited = [];
+
+            if (!payload.visited.includes(this.nodeId)) {
+              payload.visited.push(this.nodeId);
+
+              // Передаємо оновлення всім сусідам крім того, від кого отримали
+              this.peers.forEach((peer, nodeId) => {
+                if (
+                  nodeId !== fromNodeId &&
+                  !payload.visited.includes(nodeId)
+                ) {
+                  this.sendEncryptedMessage(
+                    peer.socket,
+                    payload,
+                    peer.sessionKey
+                  );
+                }
+              });
+            }
+          }
         }
         break;
     }
@@ -532,22 +582,6 @@ class DistributedNode {
       );
       this.routeMessage(payload);
     }
-  }
-
-  updateTopology(peerNodeId, peerTopology) {
-    if (!this.topology.has(this.nodeId)) {
-      this.topology.set(this.nodeId, []);
-    }
-
-    if (!this.topology.get(this.nodeId).includes(peerNodeId)) {
-      this.topology.get(this.nodeId).push(peerNodeId);
-    }
-
-    if (peerTopology) {
-      mergeTopology(this.topology, peerTopology, this.nodeId);
-    }
-
-    this.buildRoutingTable();
   }
 
   buildRoutingTable() {
